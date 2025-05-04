@@ -402,7 +402,7 @@ class ExpertOptionAsync:
         """Fetch available candle timeframes."""
         default_timeframes = [5, 60, 300, 900, 1800, 3600, 14400, 86400]
         if self.client.timeframes_data:
-            timeframes = self.client.timeframes_data.get("message", {}).get("timeframes", [])
+            timeframes = self.client.timeframes_data.get("message", {}).get("candlesTimeframes", [])
             if timeframes:
                 self.logger.info(f"Fetched timeframes from cache: {timeframes}")
                 return timeframes
@@ -412,7 +412,7 @@ class ExpertOptionAsync:
         try:
             response = await asyncio.wait_for(self.client.recv(ns), timeout=5.0)
             self.client.timeframes_data = response
-            timeframes = response.get("message", {}).get("timeframes", [])
+            timeframes = response.get("message", {}).get("candlesTimeframes", [])
             if not timeframes:
                 self.logger.warning("Server returned empty timeframes, using default timeframes")
                 return default_timeframes
