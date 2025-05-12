@@ -1,7 +1,9 @@
 from ExpertOptionsToolsV2.validator import Validator
-from ExpertOptionsToolsV2.tracing import Logger
+from ExpertOptionsToolsV2.tracing import Logger, LogBuilder
 from ExpertOptionsToolsV2.constants import get_asset_id, DEFAULT_SERVER
+from ExpertOptionsToolsV2.constants import *
 from datetime import timedelta, datetime
+from typing import Optional
 import asyncio
 import asyncio.locks
 import websockets
@@ -21,7 +23,8 @@ class AsyncSubscription:
         return self
 
     async def __anext__(self):
-        return json.loads(await anext(self.subscription))
+        """Return the next item from the subscription without JSON parsing."""
+        return await anext(self.subscription)
 
 class WebSocketClient:
     def __init__(self, token, logger, url):
@@ -34,6 +37,7 @@ class WebSocketClient:
         self.recv_lock = asyncio.Lock()
         self.receive_task = None
         self.ping_task = None
+        self.receive_loop_running = False
         self.profile_data = None
         self.assets_data = None
         self.timeframes_data = None
@@ -84,9 +88,15 @@ class WebSocketClient:
     async def send(self, message):
         """Send a message to the WebSocket server."""
         if not self.connected:
-            raise ConnectionError("WebSocket is not connected")
+            self.logger.warning("WebSocket not connected. Reconnecting...")
+            await self.connect()
         self.logger.debug(f"Sending message: {message}")
-        await self.ws.send(message)
+        try:
+            await self.ws.send(message)
+        except websockets.exceptions.ConnectionClosed as e:
+            self.logger.warning(f"Connection closed during send: {e}. Reconnecting...")
+            await self.connect()
+            await self.ws.send(message)
 
     async def recv(self, key):
         """Receive a response for the given key."""
@@ -296,6 +306,7 @@ class ExpertOptionAsync:
         self.profile = None
         self.assets_data = []
         self.active_subscriptions = set()
+        self.candle_cache = {}  # Cache for candles: {asset_id: {timeframe: {"candles": [], "expTimes": []}}}
 
     async def connect(self) -> None:
         """Connect to the ExpertOption API."""
@@ -431,7 +442,7 @@ class ExpertOptionAsync:
         if not timeframes:
             self.logger.warning(f"No timeframes available for asset ID {asset_id}, using default timeframes")
             return [5, 60, 300, 900, 1800, 3600, 14400, 86400]
-        return timeframes  # Placeholder; enhance if server supports asset-specific timeframes
+        return timeframes
 
     async def fetch_user_groups(self) -> list[dict]:
         """Fetch user group data."""
@@ -488,16 +499,49 @@ class ExpertOptionAsync:
         return response.get("message", {}).get("achievements", [])
 
     async def subscribe_expert_options(self) -> dict:
-        """Subscribe to expert options data."""
+        """Subscribe to expert options signals."""
         ns = str(uuid4())
-        await self.client.send(json.dumps({"action":"expertSubscribe","ns":ns,"token":self.token}))
+        await self.client.send(json.dumps({
+            "action": "expertSubscribe",
+            "message": {"is_demo": 1, "subscription_type": "signals"},
+            "ns": ns,
+            "token": self.token
+        }))
         response = await self.client.recv(ns)
         return response.get("message", {})
+
+    async def unsubscribe(self, asset_id: int) -> bool:
+        """Unsubscribe from candles for a specific asset."""
+        if asset_id not in self.active_subscriptions:
+            self.logger.info(f"No active subscription for asset ID {asset_id}")
+            return True
+
+        ns = str(uuid4())
+        payload = {
+            "action": "unsubscribeCandles",
+            "message": {"assets": [{"id": asset_id}]},
+            "ns": ns,
+            "token": self.token
+        }
+        try:
+            await self.client.send(json.dumps(payload))
+            self.logger.info(f"Sent unsubscribe request for asset ID {asset_id}")
+            response = await asyncio.wait_for(self.client.recv(ns), timeout=5.0)
+            self.active_subscriptions.remove(asset_id)
+            self.logger.info(f"Unsubscribed from asset ID {asset_id}: {response}")
+            return True
+        except asyncio.TimeoutError:
+            self.logger.warning(f"Timeout waiting for unsubscribe response for asset ID {asset_id}")
+            self.active_subscriptions.remove(asset_id)  # Remove anyway to prevent conflicts
+            return False
+        except Exception as e:
+            self.logger.error(f"Failed to unsubscribe from asset ID {asset_id}: {e}")
+            return False
 
     async def filter_active_assets(self) -> list[dict]:
         """Return only active assets with positive profit."""
         assets = await self.fetch_assets()
-        return [a for a in assets if a.get("is_active")==1 and a.get("profit",0)>0]
+        return [a for a in assets if a.get("is_active") == 1 and a.get("profit", 0) > 0]
 
     async def print_available_assets(self) -> None:
         """Print all available assets with IDs and symbols."""
@@ -513,12 +557,12 @@ class ExpertOptionAsync:
         active = await self.filter_active_assets()
         if not active:
             return None
-        return max(active, key=lambda x: x.get("profit",0))
+        return max(active, key=lambda x: x.get("profit", 0))
 
     async def check_asset_availability(self, asset_id: int) -> bool:
         """Verify if an asset is tradable."""
         assets = await self.fetch_assets()
-        asset = next((a for a in assets if a['id']==asset_id), None)
+        asset = next((a for a in assets if a['id'] == asset_id), None)
         if not asset:
             self.logger.error(f"Asset ID {asset_id} not found")
             return False
@@ -551,20 +595,35 @@ class ExpertOptionAsync:
         3. Wait for buySuccessful → extract deal_id
         4. Optionally wait for tradesStatus if check_win=True
         """
-        # 1. Validate asset
+        # Reconnect if not connected
+        if not self.client.connected:
+            self.logger.warning("WebSocket not connected. Reconnecting...")
+            await self.client.connect()
+
+        # Validate asset
         if not await self.check_asset_availability(asset_id):
             self.logger.error(f"Asset ID {asset_id} is not available for trading")
             raise ValueError(f"Asset ID {asset_id} is not available for trading")
 
-        # 2. Timing params
+        # Validate minimum bet amount
         assets = await self.fetch_assets()
-        asset = next(a for a in assets if a['id'] == asset_id)
+        asset = next((a for a in assets if a['id'] == asset_id), None)
+        if not asset:
+            self.logger.error(f"Asset ID {asset_id} not found in assets")
+            raise ValueError(f"Asset ID {asset_id} not found")
+
+        min_bet = asset.get('min_bet', 4.0)
+        if amount < min_bet:
+            self.logger.error(f"Amount {amount} is below minimum bet amount {min_bet} for asset ID {asset_id}")
+            raise ValueError(f"Amount {amount} is below minimum bet amount {min_bet}")
+
+        # Timing params
         expiration_step = asset.get('expiration_step', 5)
         purchase_time = asset.get('purchase_time', 30)
         server_time = await self.get_server_time()
         strike = strike_time or (server_time + purchase_time)
 
-        # 3. Build payload
+        # Build payload
         ns = str(uuid4())
         expiration_shift = max(2, (expiration_time + expiration_step - 1) // expiration_step)
         payload = {
@@ -584,15 +643,31 @@ class ExpertOptionAsync:
         await self.client.send(json.dumps(payload))
         self.logger.debug(f"Sent buyOption: {payload}")
 
-        # 4. Wait buyOption response (often empty)
+        # Wait buyOption response
         try:
             buy_resp = await asyncio.wait_for(self.client.recv(ns), timeout=5.0)
             self.logger.info(f"BuyOption response received: {buy_resp}")
+            # Check for error in initial response
+            if buy_resp.get("action") == "error":
+                error_msg = buy_resp.get("message", "Unknown error")
+                self.logger.error(f"Initial buyOption error: {error_msg}")
+                if error_msg == "ERROR_EXPECT_REAL_CONTEXT" and self.demo:
+                    self.logger.error("Trading requires a real account, but demo mode is active")
+                    raise ValueError("Trading requires a real account. Please switch to real mode or use a different asset.")
+                raise ValueError(f"Initial buyOption failed: {error_msg}")
         except asyncio.TimeoutError:
             self.logger.error(f"Timeout waiting for buyOption response for asset ID {asset_id}")
             raise TimeoutError("No response received for buyOption")
+        except ValueError as e:
+            if "ERROR_EXPECT_REAL_CONTEXT" in str(e):
+                self.logger.error("Trading requires a real account, but demo mode is active")
+                raise ValueError("Trading requires a real account. Please switch to real mode or use a different asset.")
+            raise
+        except Exception as e:
+            self.logger.error(f"Unexpected error in buyOption: {e}, response: {buy_resp if 'buy_resp' in locals() else 'None'}")
+            raise ValueError(f"Unexpected error in buyOption: {e}")
 
-        # 5. Extract deal_id from buySuccessful
+        # Extract deal_id from buySuccessful
         deal_id = None
         start = time.time()
         while time.time() - start < 10.0:
@@ -605,17 +680,20 @@ class ExpertOptionAsync:
                     break
                 elif msg.get("action") == "error":
                     error_msg = msg.get("message", "Unknown error")
-                    self.logger.error(f"Error in buyOption: {error_msg}")
-                    raise ValueError(f"Buy failed: {error_msg}")
+                    self.logger.error(f"Error in buyOption confirmation: {error_msg}")
+                    if error_msg == "ERROR_EXPECT_REAL_CONTEXT":
+                        self.logger.error("Trading requires a real account, but demo mode is active")
+                        raise ValueError("Trading requires a real account. Please switch to real mode or use a different asset.")
+                    raise ValueError(f"Buy confirmation failed: {error_msg}")
             if deal_id is not None:
                 break
             await asyncio.sleep(0.1)
 
         if deal_id is None:
-            self.logger.error(f"No buySuccessful message received for asset ID {asset_id}")
+            self.logger.error(f"No buySuccessful message received for asset ID {asset_id}. Unhandled messages: {self.client.unhandled_messages}")
             raise TimeoutError("No buySuccessful message received with deal_id")
 
-        # 6. Optionally wait for win/loss
+        # Optionally wait for win/loss
         if check_win:
             result = await self.check_win(str(deal_id))
             return str(deal_id), result
@@ -630,20 +708,35 @@ class ExpertOptionAsync:
         3. Wait for buySuccessful → extract deal_id
         4. Optionally wait for tradesStatus if check_win=True
         """
-        # 1. Validate asset
+        # Reconnect if not connected
+        if not self.client.connected:
+            self.logger.warning("WebSocket not connected. Reconnecting...")
+            await self.client.connect()
+
+        # Validate asset
         if not await self.check_asset_availability(asset_id):
             self.logger.error(f"Asset ID {asset_id} is not available for trading")
             raise ValueError(f"Asset ID {asset_id} is not available for trading")
 
-        # 2. Timing params
+        # Validate minimum bet amount
         assets = await self.fetch_assets()
-        asset = next(a for a in assets if a['id'] == asset_id)
+        asset = next((a for a in assets if a['id'] == asset_id), None)
+        if not asset:
+            self.logger.error(f"Asset ID {asset_id} not found in assets")
+            raise ValueError(f"Asset ID {asset_id} not found")
+
+        min_bet = asset.get('min_bet', 4.0)
+        if amount < min_bet:
+            self.logger.error(f"Amount {amount} is below minimum bet amount {min_bet} for asset ID {asset_id}")
+            raise ValueError(f"Amount {amount} is below minimum bet amount {min_bet}")
+
+        # Timing params
         expiration_step = asset.get('expiration_step', 5)
         purchase_time = asset.get('purchase_time', 30)
         server_time = await self.get_server_time()
         strike = strike_time or (server_time + purchase_time)
 
-        # 3. Build payload
+        # Build payload
         ns = str(uuid4())
         expiration_shift = max(2, (expiration_time + expiration_step - 1) // expiration_step)
         payload = {
@@ -663,15 +756,31 @@ class ExpertOptionAsync:
         await self.client.send(json.dumps(payload))
         self.logger.debug(f"Sent buyOption: {payload}")
 
-        # 4. Wait buyOption response (often empty)
+        # Wait buyOption response
         try:
             buy_resp = await asyncio.wait_for(self.client.recv(ns), timeout=5.0)
             self.logger.info(f"BuyOption response received: {buy_resp}")
+            # Check for error in initial response
+            if buy_resp.get("action") == "error":
+                error_msg = buy_resp.get("message", "Unknown error")
+                self.logger.error(f"Initial buyOption error: {error_msg}")
+                if error_msg == "ERROR_EXPECT_REAL_CONTEXT" and self.demo:
+                    self.logger.error("Trading requires a real account, but demo mode is active")
+                    raise ValueError("Trading requires a real account. Please switch to real mode or use a different asset.")
+                raise ValueError(f"Initial buyOption failed: {error_msg}")
         except asyncio.TimeoutError:
             self.logger.error(f"Timeout waiting for buyOption response for asset ID {asset_id}")
             raise TimeoutError("No response received for buyOption")
+        except ValueError as e:
+            if "ERROR_EXPECT_REAL_CONTEXT" in str(e):
+                self.logger.error("Trading requires a real account, but demo mode is active")
+                raise ValueError("Trading requires a real account. Please switch to real mode or use a different asset.")
+            raise
+        except Exception as e:
+            self.logger.error(f"Unexpected error in buyOption: {e}, response: {buy_resp if 'buy_resp' in locals() else 'None'}")
+            raise ValueError(f"Unexpected error in buyOption: {e}")
 
-        # 5. Extract deal_id from buySuccessful
+        # Extract deal_id from buySuccessful
         deal_id = None
         start = time.time()
         while time.time() - start < 10.0:
@@ -684,17 +793,20 @@ class ExpertOptionAsync:
                     break
                 elif msg.get("action") == "error":
                     error_msg = msg.get("message", "Unknown error")
-                    self.logger.error(f"Error in buyOption: {error_msg}")
-                    raise ValueError(f"Buy failed: {error_msg}")
+                    self.logger.error(f"Error in buyOption confirmation: {error_msg}")
+                    if error_msg == "ERROR_EXPECT_REAL_CONTEXT":
+                        self.logger.error("Trading requires a real account, but demo mode is active")
+                        raise ValueError("Trading requires a real account. Please switch to real mode or use a different asset.")
+                    raise ValueError(f"Buy confirmation failed: {error_msg}")
             if deal_id is not None:
                 break
             await asyncio.sleep(0.1)
 
         if deal_id is None:
-            self.logger.error(f"No buySuccessful message received for asset ID {asset_id}")
+            self.logger.error(f"No buySuccessful message received for asset ID {asset_id}. Unhandled messages: {self.client.unhandled_messages}")
             raise TimeoutError("No buySuccessful message received with deal_id")
 
-        # 6. Optionally wait for win/loss
+        # Optionally wait for win/loss
         if check_win:
             result = await self.check_win(str(deal_id))
             return str(deal_id), result
@@ -703,14 +815,12 @@ class ExpertOptionAsync:
 
     async def check_win(self, deal_id: str, timeout: int = 90) -> dict:
         """
-        Track openTradeSuccessful, closeTradeSuccessful, tradesStatus, optStatus, and optionFinished
-        to determine win/loss/draw. Prioritize optionFinished and closeTradeSuccessful for final results.
+        Track trade status to determine win/loss/draw.
         """
         start = time.time()
         interim_result = None
 
         while time.time() - start < timeout:
-            # Create a copy to avoid modifying the list during iteration
             for msg in list(self.client.unhandled_messages):
                 action = msg.get("action")
 
@@ -761,46 +871,26 @@ class ExpertOptionAsync:
                                 "details": t
                             }
                             self.logger.debug(f"Trade {deal_id} interim status via {action}: {interim_result}")
-                            # Do not return; wait for final result
                             continue
 
             await asyncio.sleep(0.1)
 
-        # Fallback to interim result if no final result received
         if interim_result:
             self.logger.warning(f"Trade {deal_id} no final result received; returning interim result: {interim_result}")
             return interim_result
 
-        # Log the remaining unhandled messages for debugging
         self.logger.error(f"Timeout waiting for result of deal {deal_id}. Remaining unhandled messages: {len(self.client.unhandled_messages)}")
         for msg in self.client.unhandled_messages:
             self.logger.debug(f"Unhandled message: {msg}")
         raise TimeoutError(f"Timeout waiting for result of deal {deal_id}")
 
     async def get_candles(self, asset_id: int, period: int, offset: int, duration: int = 1800, count_request: int = 3, start_time: int = None, as_dataframe: bool = True) -> list[dict] | pd.DataFrame:
-        """
-        Retrieves historical candle data for an asset ID.
-
-        :param asset_id:       ID of the asset to fetch.
-        :param period:         Timeframe in seconds (e.g. 5, 60).
-        :param offset:         Seconds to subtract from now for end_time.
-        :param duration:       Total seconds of history per batch.
-        :param count_request:  Number of batches to request.
-        :param start_time:     UNIX timestamp to start (overrides offset if set).
-        :param as_dataframe:   If True (default), return a pandas.DataFrame; else a list of dicts.
-        :return:               List of candles or DataFrame. Each candle dict has:
-                               't' (timestamp), 'tf' (timeframe), 'v' (values [o,h,l,c]).
-        """
-        # Validate asset and timeframe
+        """Retrieves historical and live candle data for an asset ID."""
         if not await self.verify_asset_subscription(asset_id, period):
             self.logger.error(f"Cannot fetch candles for asset ID {asset_id} with timeframe {period}")
             raise ValueError(f"Invalid asset ID {asset_id} or timeframe {period}")
 
-        end_time = start_time or (int(time.time()) - offset)
-        all_candles = []
-
-        for _ in range(count_request):
-            # Subscribe to candles
+        if asset_id not in self.active_subscriptions:
             ns_sub = str(uuid4())
             await self.client.send(json.dumps({
                 "action": "subscribeCandles",
@@ -808,8 +898,17 @@ class ExpertOptionAsync:
                 "ns": ns_sub,
                 "token": self.token
             }))
+            self.active_subscriptions.add(asset_id)
+            self.logger.info(f"Subscribed to candles for asset ID {asset_id}, timeframe {period}")
 
-            # Request historical candles
+        if asset_id not in self.candle_cache:
+            self.candle_cache[asset_id] = {}
+        if period not in self.candle_cache[asset_id]:
+            self.candle_cache[asset_id][period] = {"candles": [], "expTimes": []}
+
+        end_time = start_time or (int(time.time()) - offset)
+
+        for _ in range(count_request):
             ns_hist = str(uuid4())
             await self.client.send(json.dumps({
                 "action": "assetHistoryCandles",
@@ -822,83 +921,333 @@ class ExpertOptionAsync:
                 "token": self.token
             }))
 
-            collected = []
-            seen = set()
-            for _ in range(100):
-                # Process live candles
+            start = time.time()
+            while time.time() - start < 5.0:
                 while self.client.candle_queue:
                     msg = self.client.candle_queue.popleft()
                     body = msg.get("message", {})
-                    if body.get("assetId") != asset_id:
-                        continue
-                    for c in body.get("candles", []):
-                        ts = c.get("t")
-                        if c.get("tf") == period and ts not in seen and len(c.get("v", [])) >= 4:
-                            collected.append(c)
-                            seen.add(ts)
+                    if body.get("assetId") == asset_id:
+                        await self.update_candle_cache(msg, asset_id, period)
 
-                # Process historical candles
                 while self.client.history_candle_queue:
                     msg = self.client.history_candle_queue.popleft()
                     body = msg.get("message", {})
-                    if body.get("assetId") != asset_id:
-                        continue
-                    for c in body.get("candles", []):
-                        if isinstance(c, dict) and c.get("tf") == period and "t" in c and "v" in c:
-                            ts = c["t"]
-                            if len(c["v"]) >= 4 and ts not in seen:
-                                collected.append(c)
-                                seen.add(ts)
-                        elif isinstance(c, list) and len(c) >= 2:
-                            ts, v_list = c[0], c[1]
-                            if len(v_list) >= 4 and ts not in seen:
-                                candle = {"tf": period, "t": ts, "v": v_list}
-                                collected.append(candle)
-                                seen.add(ts)
-                if collected:
-                    break
+                    if body.get("assetId") == asset_id:
+                        await self.update_candle_cache(msg, asset_id, period)
+
                 await asyncio.sleep(0.05)
 
-            all_candles.extend(collected)
-            if collected:
-                end_time = min(c["t"] for c in collected) - duration
+            candles = self.candle_cache[asset_id][period]["candles"]
+            if candles:
+                end_time = min(c["time"].timestamp() for c in candles) - duration
 
-        all_candles.sort(key=lambda x: x["t"])
+        candles = self.candle_cache[asset_id][period]["candles"]
+        if not candles:
+            self.logger.warning(f"No candles available for asset ID {asset_id}, timeframe {period}")
+            return pd.DataFrame() if as_dataframe else []
+
+        self.logger.info(f"Returning {len(candles)} candles for asset ID {asset_id}, timeframe {period}")
 
         if as_dataframe:
-            df = pd.DataFrame([{
-                "time": c["t"],
-                "open": c["v"][0],
-                "high": c["v"][1],
-                "low": c["v"][2],
-                "close": c["v"][3],
-                "timeframe": c["tf"]
-            } for c in all_candles])
-            if df.empty:
-                self.logger.warning(f"No candles retrieved for asset ID {asset_id}")
-                return df
-            df["time"] = pd.to_datetime(df["time"], unit="s")
+            df = pd.DataFrame(candles)
+            df["time"] = pd.to_datetime(df["time"])
+            df = df.sort_values(by="time").drop_duplicates(subset="time", keep="last")
+            df = df[["time", "open", "high", "low", "close", "timeframe", "volume"]]
             df.set_index("time", inplace=True)
             df = df.resample(f"{period}s").agg({
                 "open": "first",
                 "high": "max",
                 "low": "min",
-                "close": "last"
+                "close": "last",
+                "timeframe": "first",
+                "volume": "sum"
             }).dropna().reset_index()
             return df
 
-        return all_candles
+        return candles
+
+    async def update_candle_cache(self, candle_response: dict, asset_id: int, timeframe: int):
+        """Update candle cache with new candle data."""
+        message = candle_response.get("message", {})
+        asset_id = message.get("assetId", asset_id)
+        timeframe = message.get("tf", timeframe)
+        self.logger.debug(f"Processing candles for asset ID {asset_id}, timeframe: {timeframe}")
+
+        candle_data = []
+        # Handle candles and historical candles
+        candles = message.get("candles", [])
+        if candles and isinstance(candles, list) and isinstance(candles[0], dict) and "periods" in candles[0]:
+            # Handle assetHistoryCandles structure
+            for period in candles[0].get("periods", []):
+                period_start = period[0]
+                period_candles = period[1]
+                for candle in period_candles:
+                    if isinstance(candle, list) and len(candle) >= 4:
+                        candle_data.append({
+                            "time": period_start,
+                            "open": float(candle[0]),
+                            "high": float(candle[1]),
+                            "low": float(candle[2]),
+                            "close": float(candle[3]),
+                            "timeframe": timeframe,
+                            "volume": 0,
+                            "source": "historical"
+                        })
+                        period_start += timeframe
+        else:
+            # Handle live candles
+            for candle in candles:
+                if isinstance(candle, dict) and "t" in candle and "v" in candle and len(candle["v"]) >= 4:
+                    candle_data.append({
+                        "time": candle["t"],
+                        "open": float(candle["v"][0]),
+                        "high": float(candle["v"][1]),
+                        "low": float(candle["v"][2]),
+                        "close": float(candle["v"][3]),
+                        "timeframe": timeframe,
+                        "volume": 0,
+                        "source": "live"
+                    })
+                elif isinstance(candle, list) and len(candle) >= 2 and len(candle[1]) >= 4:
+                    candle_data.append({
+                        "time": candle[0],
+                        "open": float(candle[1][0]),
+                        "high": float(candle[1][1]),
+                        "low": float(candle[1][2]),
+                        "close": float(candle[1][3]),
+                        "timeframe": timeframe,
+                        "volume": 0,
+                        "source": "historical"
+                    })
+
+        exp_times = message.get("expTimes", [])
+        if candle_data:
+            df = pd.DataFrame(candle_data)
+            df["time"] = pd.to_datetime(df["time"], unit="s")
+            df = df.sort_values(by="time").drop_duplicates(subset=["time", "source"], keep="last")
+
+            if asset_id not in self.candle_cache:
+                self.candle_cache[asset_id] = {}
+            if timeframe not in self.candle_cache[asset_id]:
+                self.candle_cache[asset_id][timeframe] = {"candles": [], "expTimes": []}
+
+            existing_data = self.candle_cache[asset_id][timeframe]
+            existing_candles = pd.DataFrame(existing_data["candles"])
+            if not existing_candles.empty:
+                df = pd.concat([existing_candles, df]).drop_duplicates(subset=["time", "source"], keep="last").sort_values(by="time")
+
+            existing_exp_times = existing_data["expTimes"]
+            updated_exp_times = list(set(existing_exp_times + [exp[0] for exp in exp_times]))
+
+            self.candle_cache[asset_id][timeframe] = {
+                "candles": df.to_dict("records"),
+                "expTimes": updated_exp_times
+            }
+            self.logger.info(f"Updated candles for asset ID {asset_id}, timeframe {timeframe}, total: {len(self.candle_cache[asset_id][timeframe]['candles'])}")
+            self.logger.debug(f"Updated expTimes for asset ID {asset_id}, total: {len(self.candle_cache[asset_id][timeframe]['expTimes'])}")
+        else:
+            self.logger.debug(f"No valid candle data received for asset ID {asset_id}")
+
+    async def historySteps(self, asset_id: int, timeframe: int, start_time: int, end_time: int) -> list[dict]:
+        """Fetch historical candles for specific time range."""
+        if not await self.verify_asset_subscription(asset_id, timeframe):
+            self.logger.error(f"Cannot fetch historical candles for asset ID {asset_id} with timeframe {timeframe}")
+            raise ValueError(f"Invalid asset ID {asset_id} or timeframe {timeframe}")
+
+        ns = str(uuid4())
+        await self.client.send(json.dumps({
+            "action": "assetHistoryCandles",
+            "message": {
+                "assetid": asset_id,
+                "periods": [[start_time, end_time]],
+                "timeframes": [timeframe]
+            },
+            "ns": ns,
+            "token": self.token
+        }))
+        response = await self.client.recv(ns)
+        await self.update_candle_cache(response, asset_id, timeframe)
+        return self.candle_cache.get(asset_id, {}).get(timeframe, {}).get("candles", [])
+
+    async def _subscribe_symbol_inner(self, asset_id: int, timeframes: list[int] = None):
+        """Subscribe to candles for an asset with specified timeframes."""
+        timeframes = timeframes or [5]
+        for timeframe in timeframes:
+            if not await self.verify_asset_subscription(asset_id, timeframe):
+                self.logger.error(f"Cannot subscribe to asset ID {asset_id} with timeframe {timeframe}")
+                raise ValueError(f"Invalid asset ID {asset_id} or timeframe {timeframe}")
+
+        # Ensure subscription is active
+        if asset_id not in self.active_subscriptions:
+            ns_sub = str(uuid4())
+            await self.client.send(json.dumps({
+                "action": "subscribeCandles",
+                "message": {"assets": [{"id": asset_id, "timeframes": timeframes}]},
+                "ns": ns_sub,
+                "token": self.token
+            }))
+            self.active_subscriptions.add(asset_id)
+            self.logger.info(f"Subscribed to candles for asset ID {asset_id}, timeframes {timeframes}")
+
+        # Process candle queue directly
+        while True:
+            while self.client.candle_queue:
+                msg = self.client.candle_queue.popleft()
+                if msg.get("action") != "candles" or msg.get("message", {}).get("assetId") != asset_id:
+                    continue
+                for candle in msg.get("message", {}).get("candles", []):
+                    if candle.get("tf") in timeframes and len(candle.get("v", [])) >= 4:
+                        yield {
+                            "asset_id": asset_id,
+                            "timeframe": candle["tf"],
+                            "time": candle["t"],
+                            "open": float(candle["v"][0]),
+                            "high": float(candle["v"][1]),
+                            "low": float(candle["v"][2]),
+                            "close": float(candle["v"][3])
+                        }
+            await asyncio.sleep(0.05)  # Prevent CPU overload
+
+    async def _subscribe_symbol_chunked_inner(self, asset_id: int, chunk_size: int):
+        """Subscribe to chunked candles, aggregating chunk_size candles into one."""
+        if not await self.verify_asset_subscription(asset_id, 5):
+            self.logger.error(f"Cannot subscribe to asset ID {asset_id} with chunked subscription")
+            raise ValueError(f"Invalid asset ID {asset_id}")
+
+        if asset_id not in self.active_subscriptions:
+            ns_sub = str(uuid4())
+            await self.client.send(json.dumps({
+                "action": "subscribeCandles",
+                "message": {"assets": [{"id": asset_id, "timeframes": [5]}]},
+                "ns": ns_sub,
+                "token": self.token
+            }))
+            self.active_subscriptions.add(asset_id)
+            self.logger.info(f"Subscribed to chunked candles for asset ID {asset_id}, chunk_size: {chunk_size}")
+
+        chunk = []
+        while True:
+            while self.client.candle_queue:
+                msg = self.client.candle_queue.popleft()
+                if msg.get("action") != "candles" or msg.get("message", {}).get("assetId") != asset_id:
+                    continue
+                for candle in msg.get("message", {}).get("candles", []):
+                    if candle.get("tf") == 5 and len(candle.get("v", [])) >= 4:
+                        chunk.append({
+                            "time": candle["t"],
+                            "open": float(candle["v"][0]),
+                            "high": float(candle["v"][1]),
+                            "low": float(candle["v"][2]),
+                            "close": float(candle["v"][3]),
+                            "timeframe": 5,
+                            "volume": 0
+                        })
+                        if len(chunk) >= chunk_size:
+                            aggregated_candle = await self.aggregate_candles(chunk, 5 * chunk_size)
+                            if aggregated_candle:
+                                yield aggregated_candle
+                            chunk = []
+            await asyncio.sleep(0.05)
+
+    async def _subscribe_symbol_timed_inner(self, asset_id: int, interval: timedelta):
+        """Subscribe to timed candles, aggregating candles within a specified interval."""
+        if not await self.verify_asset_subscription(asset_id, 5):
+            self.logger.error(f"Cannot subscribe to asset ID {asset_id} with timed subscription")
+            raise ValueError(f"Invalid asset ID {asset_id}")
+
+        if asset_id not in self.active_subscriptions:
+            ns_sub = str(uuid4())
+            await self.client.send(json.dumps({
+                "action": "subscribeCandles",
+                "message": {"assets": [{"id": asset_id, "timeframes": [5]}]},
+                "ns": ns_sub,
+                "token": self.token
+            }))
+            self.active_subscriptions.add(asset_id)
+            self.logger.info(f"Subscribed to timed candles for asset ID {asset_id}, interval: {interval.total_seconds()}s")
+
+        interval_seconds = interval.total_seconds()
+        current_interval_start = None
+        interval_candles = []
+
+        while True:
+            while self.client.candle_queue:
+                msg = self.client.candle_queue.popleft()
+                if msg.get("action") != "candles" or msg.get("message", {}).get("assetId") != asset_id:
+                    continue
+                for candle in msg.get("message", {}).get("candles", []):
+                    if candle.get("tf") == 5 and len(candle.get("v", [])) >= 4:
+                        candle_time = candle["t"]
+                        if current_interval_start is None:
+                            current_interval_start = candle_time
+                        # Yield aggregated candle if enough candles are collected or interval is exceeded
+                        interval_candles.append({
+                            "time": candle_time,
+                            "open": float(candle["v"][0]),
+                            "high": float(candle["v"][1]),
+                            "low": float(candle["v"][2]),
+                            "close": float(candle["v"][3]),
+                            "timeframe": 5,
+                            "volume": 0
+                        })
+                        # Check if we can yield an aggregated candle
+                        if len(interval_candles) >= 2 or candle_time >= current_interval_start + interval_seconds:
+                            aggregated_candle = await self.aggregate_candles(interval_candles, interval_seconds)
+                            if aggregated_candle:
+                                yield aggregated_candle
+                            current_interval_start = candle_time
+                            interval_candles = [interval_candles[-1]] if interval_candles else []
+            await asyncio.sleep(0.05)  # Prevent CPU overload
+
+    async def aggregate_candles(self, candles: list[dict], timeframe: int) -> dict:
+        """Aggregate a list of candles into a single candle."""
+        if not candles:
+            return {}
+        df = pd.DataFrame(candles)
+        if df.empty:
+            return {}
+        aggregated = {
+            "time": df["time"].iloc[0],
+            "open": df["open"].iloc[0],
+            "high": df["high"].max(),
+            "low": df["low"].min(),
+            "close": df["close"].iloc[-1],
+            "timeframe": timeframe,
+            "volume": df["volume"].sum(),
+            "source": "aggregated"
+        }
+        return aggregated
+
+    async def subscribe_symbol(self, asset_id: int, timeframes: list[int] = None) -> AsyncSubscription:
+        """Real-time candle subscription for an asset with specified timeframes."""
+        return AsyncSubscription(self._subscribe_symbol_inner(asset_id, timeframes))
+
+    async def subscribe_symbol_chunked(self, asset_id: int, chunk_size: int) -> AsyncSubscription:
+        """Chunked candle subscription, aggregating chunk_size candles into one."""
+        return AsyncSubscription(self._subscribe_symbol_chunked_inner(asset_id, chunk_size))
+
+    async def subscribe_symbol_timed(self, asset_id: int, interval: timedelta) -> AsyncSubscription:
+        """Timed candle subscription, aggregating candles within a specified interval."""
+        return AsyncSubscription(self._subscribe_symbol_timed_inner(asset_id, interval))
 
     async def balance(self) -> float:
         """Retrieve current account balance."""
         prof = await self.fetch_profile()
-        bal = prof.get("demo_balance" if self.demo else "real_balance",0.0)
+        bal = prof.get("demo_balance" if self.demo else "real_balance", 0.0)
         return bal
 
+    async def payout(self, asset=None) -> dict|list|int:
+        """Retrieve payout percentages."""
+        assets = await self.fetch_assets()
+        payouts = {a["symbol"]: a.get("profit", 0) for a in assets if a.get("is_active")}
+        if isinstance(asset, str):
+            return payouts.get(asset, 0)
+        if isinstance(asset, list):
+            return [payouts.get(a, 0) for a in asset]
+        return payouts
+
     async def get_one_time_token(self) -> str:
-        """
-        Send getOneTimeToken and update self.token.
-        """
+        """Send getOneTimeToken and update self.token."""
         ns = str(uuid4())
         payload = {
             "action": "getOneTimeToken",
@@ -914,9 +1263,7 @@ class ExpertOptionAsync:
         return self.token
 
     async def open_options_stat(self) -> dict:
-        """
-        Send openOptionsStat and return stats.
-        """
+        """Send openOptionsStat and return stats."""
         ns = str(uuid4())
         payload = {
             "action": "openOptionsStat",
@@ -958,121 +1305,50 @@ class ExpertOptionAsync:
         return resp.get("message", {}).get("trades", [])
 
     async def opened_deals(self) -> list[dict]:
-        """List all open deals (alias for open_trades)."""
+        """List all open deals."""
         return await self.open_trades()
 
     async def closed_deals(self) -> list[dict]:
-        """List all closed deals (alias for trade_history)."""
+        """List all closed deals."""
         return await self.trade_history()
 
     async def clear_closed_deals(self) -> None:
         """Clear closed deals from memory."""
         await self.client.send(json.dumps({"action":"clearClosedOptions","ns":str(uuid4())}))
 
-    async def payout(self, asset=None) -> dict|list|int:
-        """Retrieve payout percentages."""
-        assets = await self.fetch_assets()
-        payouts = {a["symbol"]:a.get("profit",0) for a in assets if a.get("is_active")}
-        if isinstance(asset,str):
-            return payouts.get(asset,0)
-        if isinstance(asset,list):
-            return [payouts.get(a,0) for a in asset]
-        return payouts
-
-    async def history(self, asset_id:int, period:int) -> list[dict]:
+    async def history(self, asset_id: int, period: int) -> list[dict]:
         """Alias for get_candles with dataframe=False."""
-        return await self.get_candles(asset_id,period,0,as_dataframe=False)
+        return await self.get_candles(asset_id, period, 0, as_dataframe=False)
 
-    async def get_asset_rates(self, asset_id:int) -> list[dict]:
+    async def get_asset_rates(self, asset_id: int) -> list[dict]:
         """Get rates for a specific asset."""
         assets = await self.fetch_assets()
-        ad = next((a for a in assets if a["id"]==asset_id), None)
-        if not ad: raise ValueError(f"No data for asset {asset_id}")
-        return ad.get("rates",[])
+        ad = next((a for a in assets if a["id"] == asset_id), None)
+        if not ad:
+            raise ValueError(f"No data for asset {asset_id}")
+        return ad.get("rates", [])
 
-    async def get_open_options_stat(self, asset_id:int) -> dict:
+    async def get_open_options_stat(self, asset_id: int) -> dict:
         """Get open options statistics for an asset."""
         for msg in list(self.client.unhandled_messages):
-            if msg.get("action")=="openOptionsStat":
-                opts = msg.get("message",{}).get("openOptions",[])
+            if msg.get("action") == "openOptionsStat":
+                opts = msg.get("message", {}).get("openOptions", [])
                 for s in opts:
-                    if s.get("assetId")==asset_id:
+                    if s.get("assetId") == asset_id:
                         self.client.unhandled_messages.remove(msg)
                         return s
         ns = str(uuid4())
-        payload = {"action":"openOptionsStat","message":{"assetId":asset_id},"ns":ns,"token":self.token}
+        payload = {"action": "openOptionsStat", "message": {"assetId": asset_id}, "ns": ns, "token": self.token}
         await self.client.send(json.dumps(payload))
         resp = await self.client.recv(ns)
-        opts = resp.get("message",{}).get("openOptions",[])
-        return next((s for s in opts if s.get("assetId")==asset_id), {})
+        opts = resp.get("message", {}).get("openOptions", [])
+        return next((s for s in opts if s.get("assetId") == asset_id), {})
 
-    async def _subscribe_symbol_inner(self, asset_id: int, timeframes: list[int] = None):
-        """Subscribe to candles for an asset with specified timeframes."""
-        # Default to [5] if no timeframes provided
-        timeframes = timeframes or [5]
-        
-        # Verify asset and timeframes
-        for timeframe in timeframes:
-            if not await self.verify_asset_subscription(asset_id, timeframe):
-                self.logger.error(f"Cannot subscribe to asset ID {asset_id} with timeframe {timeframe}")
-                raise ValueError(f"Invalid asset ID {asset_id} or timeframe {timeframe}")
-
-        # Unsubscribe from old subscriptions
-        for old in self.active_subscriptions.copy():
-            await self.client.send(json.dumps({
-                "action": "unsubscribeCandles",
-                "message": {"assets": [{"id": old}]},
-                "ns": str(uuid4())
-            }))
-            self.active_subscriptions.remove(old)
-
-        # Subscribe to new asset
-        validator = Validator.contains(f'"assetId":{asset_id}')
-        ns = str(uuid4())
-        payload = json.dumps({
-            "action": "subscribeCandles",
-            "message": {
-                "assets": [{"id": asset_id, "timeframes": timeframes}]
-            },
-            "ns": ns,
-            "token": self.token
-        })
-        await self.client.send(payload)
-        self.active_subscriptions.add(asset_id)
-        self.logger.info(f"Subscribed to asset ID {asset_id} with timeframes {timeframes}")
-
-        async for data in self.create_raw_iterator(payload, validator):
-            yield data
-
-    async def _subscribe_symbol_chunked_inner(self, asset_id:int, chunk_size:int):
-        """Subscribe to chunked candles."""
-        validator = Validator.contains(f'"assetId":{asset_id}')
-        payload = json.dumps({"action":"subscribeChunked","message":{"assetId":asset_id,"chunkSize":chunk_size},"ns":str(uuid4())})
-        return await self.create_raw_iterator(payload, validator)
-
-    async def _subscribe_symbol_timed_inner(self, asset_id:int, time:timedelta):
-        """Subscribe to timed candles."""
-        validator = Validator.contains(f'"assetId":{asset_id}')
-        payload = json.dumps({"action":"subscribeTimed","message":{"assetId":asset_id,"interval":int(time.total_seconds())},"ns":str(uuid4())})
-        return await self.create_raw_iterator(payload, validator)
-
-    async def subscribe_symbol(self, asset_id: int, timeframes: list[int] = None) -> AsyncSubscription:
-        """Real-time candle subscription for an asset with specified timeframes."""
-        return AsyncSubscription(await self._subscribe_symbol_inner(asset_id, timeframes))
-
-    async def subscribe_symbol_chunked(self, asset_id:int, chunk_size:int) -> AsyncSubscription:
-        """Chunked candle subscription."""
-        return AsyncSubscription(await self._subscribe_symbol_chunked_inner(asset_id, chunk_size))
-
-    async def subscribe_symbol_timed(self, asset_id:int, time:timedelta) -> AsyncSubscription:
-        """Timed candle subscription."""
-        return AsyncSubscription(await self._subscribe_symbol_timed_inner(asset_id, time))
-
-    async def send_raw_message(self, message:str) -> None:
+    async def send_raw_message(self, message: str) -> None:
         """Send a raw WebSocket message."""
         await self.client.send(message)
 
-    async def create_raw_order(self, message:str, validator:Validator) -> str:
+    async def create_raw_order(self, message: str, validator: Validator) -> str:
         """Send raw order and validate response."""
         await self.client.send(message)
         key = json.loads(message).get("ns", json.loads(message).get("action"))
@@ -1081,113 +1357,35 @@ class ExpertOptionAsync:
             return json.dumps(resp)
         raise ValueError("Response did not match validator")
 
-    async def create_raw_iterator(self, message:str, validator:Validator):
+    async def create_raw_iterator(self, message: str, validator: Validator):
         """Iterator for validated raw messages."""
         await self.client.send(message)
+        key = json.loads(message).get("ns", json.loads(message).get("action"))
         while True:
-            key = json.loads(message).get("ns", json.loads(message).get("action"))
-            resp = await self.client.recv(key)
-            if validator.check(json.dumps(resp)):
-                yield resp
-
-    async def get_candles_dataframe(self, asset_id: int, period: int, duration: int) -> pd.DataFrame:
-        """
-        Subscribe to live candles + fetch history, merge & resample into a complete OHLC DataFrame.
-        """
-        # Validate asset and timeframe
-        if not await self.verify_asset_subscription(asset_id, period):
-            self.logger.error(f"Cannot fetch candles for asset ID {asset_id} with timeframe {period}")
-            raise ValueError(f"Invalid asset ID {asset_id} or timeframe {period}")
-
-        # Subscribe to live candles
-        ns_sub = str(uuid4())
-        await self.client.send(json.dumps({
-            "action": "subscribeCandles",
-            "message": {"assets": [{"id": asset_id, "timeframes": [period]}]},
-            "ns": ns_sub,
-            "token": self.token
-        }))
-
-        # Request historical candles
-        ns_hist = str(uuid4())
-        end_time = int(await self.get_server_time())
-        await self.client.send(json.dumps({
-            "action": "assetHistoryCandles",
-            "message": {
-                "assetid": asset_id,
-                "periods": [[end_time - duration, end_time]],
-                "timeframes": [period]
-            },
-            "ns": ns_hist,
-            "token": self.token
-        }))
-
-        all_candles, seen = [], set()
-        # Collect until at least one batch arrives
-        for _ in range(100):
-            # Live queue
-            while self.client.candle_queue:
-                msg = self.client.candle_queue.popleft()
-                body = msg.get("message", {})
-                if body.get("assetId") != asset_id:
-                    continue
-                for c in body.get("candles", []):
-                    ts = c.get("t")
-                    if c.get("tf") == period and ts not in seen and len(c.get("v", [])) >= 4:
-                        all_candles.append(c)
-                        seen.add(ts)
-            # History queue
-            while self.client.history_candle_queue:
-                msg = self.client.history_candle_queue.popleft()
-                body = msg.get("message", {})
-                if body.get("assetId") != asset_id:
-                    continue
-                for c in body.get("candles", []):
-                    if isinstance(c, dict) and c.get("tf") == period and "t" in c and "v" in c:
-                        ts = c["t"]
-                        if ts not in seen and len(c["v"]) >= 4:
-                            all_candles.append(c)
-                            seen.add(ts)
-                    elif isinstance(c, list) and len(c) >= 2:
-                        ts, v_list = c[0], c[1]
-                        if len(v_list) >= 4 and ts not in seen:
-                            candle = {"tf": period, "t": ts, "v": v_list}
-                            all_candles.append(candle)
-                            seen.add(ts)
-            if all_candles:
-                break
-            await asyncio.sleep(0.05)
-
-        # Build DataFrame
-        all_candles.sort(key=lambda x: x["t"])
-        df = pd.DataFrame([{
-            "time": c["t"],
-            "open": c["v"][0],
-            "high": c["v"][1],
-            "low": c["v"][2],
-            "close": c["v"][3],
-            "timeframe": c["tf"]
-        } for c in all_candles])
-        if df.empty:
-            self.logger.warning(f"No candles retrieved for asset ID {asset_id}")
-            return df
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        df.set_index("time", inplace=True)
-        df = df.resample(f"{period}s").agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last"
-        }).dropna().reset_index()
-        return df
+            async with self.client.recv_lock:
+                if key not in self.client.pending_responses or self.client.pending_responses[key].done():
+                    self.client.pending_responses[key] = asyncio.Future()
+                response = await self.client.pending_responses[key]
+                if validator.check(json.dumps(response)):
+                    yield response
+                else:
+                    self.logger.debug(f"Response did not match validator: {response}")
 
     async def get_server_time(self) -> int:
         """Retrieves the current server time."""
-        await self.send_ping()
         try:
-            response = await asyncio.wait_for(self.client.recv("pong"), timeout=5.0)
-            ts = response.get("message", {}).get("data", str(int(time.time() * 1000)))[:10]
-            return int(ts)
-        except asyncio.TimeoutError:
-            self.logger.warning("Timeout waiting for pong response, using local time")
-            return int(time.time())
+            if not self.client.connected:
+                self.logger.warning("WebSocket not connected. Reconnecting...")
+                await self.client.connect()
+            await self.send_ping()
+            try:
+                response = await asyncio.wait_for(self.client.recv("pong"), timeout=5.0)
+                ts = response.get("message", {}).get("data", str(int(time.time() * 1000)))[:10]
+                return int(ts)
+            except asyncio.TimeoutError:
+                self.logger.warning("Timeout waiting for pong response, using local time")
+                return int(time.time())
+        except websockets.exceptions.ConnectionClosed as e:
+            self.logger.warning(f"Connection closed during get_server_time: {e}. Reconnecting...")
+            await self.client.connect()
+            return await self.get_server_time()  # Retry
