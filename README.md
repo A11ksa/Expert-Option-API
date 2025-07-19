@@ -1,157 +1,261 @@
-ExpertOptionsToolsV2
-ExpertOptionsToolsV2 is a Python library designed to interact with the Expert Option trading platform via its WebSocket API. It provides both asynchronous (ExpertOptionAsync) and synchronous (ExpertOption) clients to perform trading operations, fetch market data, and manage account activities. The library supports demo and real accounts, asset selection, trade placement (call/put), and real-time candle subscriptions.
-Developed by Ahmed (Telegram: @A11ksa).
-Features
+<div align="center">
+  <h1>ExpertOptionsToolsV2 – Python Async & Sync WebSocket Client</h1>
+  <p>
+    <b>⚡ Professional Python client for Expert Option via WebSocket (Async & Sync) ⚡</b><br>
+    <img src="https://img.shields.io/pypi/v/ExpertOptionsToolsV2?label=PyPI&logo=python" alt="PyPI Version" />
+    <img src="https://img.shields.io/github/license/A11ksa/Expert-Option-API?style=flat-square" alt="License" />
+    <img src="https://img.shields.io/badge/asyncio-supported-brightgreen?logo=python" alt="AsyncIO Supported"/>
+    <img src="https://img.shields.io/badge/rich-output-blue?logo=python" alt="Rich Output"/>
+    <img src="https://img.shields.io/badge/status-stable-success?logo=github" alt="Status"/>
+  </p>
+</div>
 
-Asynchronous and Synchronous Clients: Use ExpertOptionAsync for async operations or ExpertOption for synchronous operations.
-Trading Operations: Place call (buy) and put (sell) trades with customizable expiration times.
-Market Data: Fetch historical candles, real-time candle subscriptions, and asset payout percentages.
-Account Management: Retrieve account balance, open/closed deals, and user profile data.
-Logging: Built-in logging to file and terminal for debugging and monitoring.
-Validation: Flexible message validation for WebSocket responses.
-Asset Support: Extensive list of assets (e.g., EURUSD, BTCUSD, AAPL) with IDs and symbols.
+---
 
-Installation
-Prerequisites
+## Table of Contents
 
-Python 3.8 or higher
-A valid Expert Option API token (obtain from the Expert Option platform)
+- [Overview](#overview)  
+- [Installation](#installation)  
+- [Quick Start](#quick-start)  
+- [Modules](#modules)  
+  - [Async Client](#async-client)  
+  - [Sync Client](#sync-client)  
+  - [Constants & Helpers](#constants--helpers)  
+  - [Validator](#validator)  
+  - [Tracing & Logging](#tracing--logging)  
+- [Examples](#examples)  
+  - [Basic Async Workflow](#basic-async-workflow)  
+  - [Historical Candles DataFrame](#historical-candles-dataframe)  
+  - [Synchronous Trading Script](#synchronous-trading-script)  
+  - [Custom Signal Bot](#custom-signal-bot)  
+- [Configuration](#configuration)  
+- [Troubleshooting](#troubleshooting)  
+- [Contributing](#contributing)  
+- [License](#license)  
+- [Contact](#contact)  
 
-Install via pip
+---
 
-Clone the repository or download the project files:
+## 📖 Overview
+
+**ExpertOptionsToolsV2** is a Python library that enables seamless interaction with the Expert Option trading platform via its WebSocket API. It supports both **asynchronous** and **synchronous** workflows, offers robust connection management, and integrates powerful utilities for market data, trade execution, and logging.
+
+---
+
+## 🛠️ Installation
+
+```bash
+# Clone and install the library
 git clone https://github.com/A11ksa/Expert-Option-API.git
 cd Expert-Option-API
-
-
-Create and activate a virtual environment (recommended):
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-venv\Scripts\activate     # Windows
-
-
-Install the library and its dependencies:
+python3 -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install .
+```
 
+**Core dependencies**:
+- `websockets>=11.0.3`  
+- `pandas>=1.5.0`  
+- `rich>=13.0.0`  
 
+**Dev dependencies** (for testing & formatting):
+```bash
+pip install pytest pytest-asyncio black isort
+```
 
-Dependencies
+---
 
-websockets>=11.0.3
-pandas>=1.5.0
-rich>=13.0.0 (for colored console output in examples)
+## ⚡ Quick Start
 
-Usage
-Example: Placing a Trade
-The following example demonstrates how to connect to the Expert Option API, fetch available assets, and place a buy (call) trade using the asynchronous client.
+### Asynchronous Client
+```python
 import asyncio
-from ExpertOptionsToolsV2.expertoption import ExpertOptionAsync
+from ExpertOptionsToolsV2.expertoption.asyncronous import ExpertOptionAsync
+from ExpertOptionsToolsV2.constants import DEFAULT_SERVER
+
+async def main():
+    token = "YOUR_AUTH_TOKEN"  # e.g., from DevTools "auth" cookie
+    client = ExpertOptionAsync(token=token, demo=True, url=DEFAULT_SERVER)
+    await client.connect()
+
+    balance = await client.balance()
+    print("Balance:", balance)
+
+    assets = await client.fetch_assets()
+    print("Assets:", len(assets), "symbols available")
+
+    # Place a CALL trade for 60 seconds
+    trade_id, result = await client.buy(
+        asset_id=142,         # e.g., ID for EURUSD
+        amount=5.0,
+        expiration_time=60,
+        check_win=True
+    )
+    print("Trade complete:", result)
+
+    await client.disconnect()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+---
+
+## 📦 Modules
+
+### Async Client
+- **Location**: `ExpertOptionsToolsV2/expertoption/asyncronous.py`  
+- **Class**: `ExpertOptionAsync`  
+- **Key methods**:  
+  - `connect()` / `disconnect()`  
+  - `balance()`, `fetch_assets()`, `get_candles()`  
+  - `subscribe_symbol()` for streaming updates  
+  - `buy()`, `sell()`, `check_win()`
+
+### Sync Client
+- **Location**: `ExpertOptionsToolsV2/expertoption/syncronous.py`  
+- **Class**: `ExpertOption`  
+- **Usage**: identical methods in a blocking style for easy scripting.
+
+### Constants & Helpers
+- **`constants.data_assets`**: dict mapping asset names to IDs and metadata.  
+- **`constants.DEFAULT_SERVER`**: default WebSocket URL.  
+- **Utility**: `symbol_to_id("EURUSD")` → asset ID.
+
+### Validator
+```python
+from ExpertOptionsToolsV2.validator import Validator
+
+# Validate incoming message format
+validator = Validator(prefix="42["getBalance", suffix=""]")
+raw_msg = '42["getBalance", {"balance": 100}]'
+if validator.validate(raw_msg):
+    print("Valid balance payload")
+```
+
+### Tracing & Logging
+```python
 from ExpertOptionsToolsV2.tracing import LogBuilder
 
-# Configure logging
-logger = LogBuilder().log_file("trade.log", "INFO").build()
+logger = (
+    LogBuilder()
+    .log_file("logs/trades.log", level="INFO")
+    .terminal(level="DEBUG")
+    .build()
+)
+logger.info("Client connected!")
+```
 
-async def main():
-    # Initialize the API client (replace with your token)
-    token = "Your_ExpertOption_Token"
-    api = ExpertOptionAsync(token=token, demo=True)
+---
 
-    try:
-        # Connect to the API
-        await api.connect()
-        print("Connected successfully!")
+## 🧑‍💻 Examples
 
-        # Fetch and print available assets
-        await api.print_available_assets()
+### Basic Async Workflow
+```python
+import asyncio
+from ExpertOptionsToolsV2.expertoption.asyncronous import ExpertOptionAsync
 
-        # Select an asset with the highest payout
-        asset = await api.select_highest_payout_asset()
-        if not asset:
-            print("No tradable assets available.")
-            return
+async def demo():
+    client = ExpertOptionAsync(token="...", demo=True)
+    await client.connect()
+    print(await client.balance())
+    print(await client.fetch_assets())
+    candles = await client.get_candles(asset_id=142, period=60, offset=0, duration=300)
+    print("Last 5 candles:", candles.tail())
+    await client.disconnect()
 
-        asset_id = asset["id"]
-        symbol = asset["symbol"]
-        print(f"Selected asset: {symbol} (ID: {asset_id})")
+asyncio.run(demo())
+```
 
-        # Place a buy trade
-        amount = 4.0
-        expiration_time = 60  # 60 seconds
-        deal_id, result = await api.buy(
-            asset_id=asset_id,
-            amount=amount,
-            expiration_time=expiration_time,
+### Historical Candles DataFrame
+```python
+df = await client.get_candles(asset_id=142, period=60, offset=0, duration=3600)
+# DataFrame with columns: time, open, high, low, close, volume
+print(df.describe())
+```
+
+### Synchronous Trading Script
+```python
+from ExpertOptionsToolsV2.expertoption.syncronous import ExpertOption
+
+client = ExpertOption(token="YOUR_TOKEN", demo=False)
+client.connect()
+bal = client.balance()
+print("Live balance:", bal)
+order_id, res = client.buy(asset_id=145, amount=2.5, expiration_time=120)
+print("Order result:", res)
+client.disconnect()
+```
+
+### Custom Signal Bot
+```python
+import asyncio
+from ExpertOptionsToolsV2.expertoption.asyncronous import ExpertOptionAsync
+
+async def signal_bot(signal_queue):
+    client = ExpertOptionAsync(token="...", demo=True)
+    await client.connect()
+    while True:
+        signal = await signal_queue.get()
+        sid, result = await client.buy(
+            asset_id=signal.asset_id,
+            amount=signal.amount,
+            expiration_time=signal.duration,
             check_win=True
         )
-        print(f"Trade ID: {deal_id}, Result: {result}")
+        print(f"Executed {sid} → {result}")
+    # (Cleanup omitted)
 
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        print(f"Error: {e}")
-    finally:
-        await api.disconnect()
+# Usage with any asyncio queue of signals
+```
 
-if __name__ == "__main__":
-    asyncio.run(main())
+---
 
-Example: Fetching Candles
-Retrieve historical candle data for an asset and display it as a pandas DataFrame.
-import asyncio
-from ExpertOptionsToolsV2.expertoption import ExpertOptionAsync
+## ⚙️ Configuration
 
-async def main():
-    token = "Your_ExpertOption_Token"
-    api = ExpertOptionAsync(token=token, demo=True)
+- **Token**: retrieve from browser cookie `"auth"`.  
+- **Demo vs Live**: `demo=True/False` flag.  
+- **Server URL**: override via `url=` parameter.  
 
-    try:
-        await api.connect()
-        candles = await api.get_candles(
-            asset_id=142,  # EURUSD
-            period=5,      # 5-second timeframe
-            offset=0,      # Recent data
-            duration=1800  # 30 minutes of data
-        )
-        print("Candles DataFrame:")
-        print(candles)
-    finally:
-        await api.disconnect()
+---
 
-if __name__ == "__main__":
-    asyncio.run(main())
+## 🛠️ Troubleshooting
 
-Key Classes and Modules
+- **Invalid auth**: ensure `token` matches your real session cookie.  
+- **Timeouts**: increase `ping_interval` or `timeout` when creating client.  
+- **Unexpected disconnects**: catch exceptions, implement retry loops:
+  ```python
+  for _ in range(5):
+      try:
+          await client.connect()
+          break
+      except Exception as e:
+          await asyncio.sleep(2)
+  ```
 
-ExpertOptionAsync: Asynchronous client for interacting with the Expert Option API.
-Methods: buy, sell, get_candles, fetch_profile, subscribe_symbol, etc.
+---
 
+## 🤝 Contributing
 
-ExpertOption: Synchronous wrapper around ExpertOptionAsync for simpler usage.
-constants.py: Contains asset IDs, symbols, and server configurations.
-tracing.py: Provides logging utilities (Logger, LogBuilder).
-validator.py: Offers tools for validating WebSocket messages.
+1. Fork the repo  
+2. Create branch `feature/...`  
+3. Follow PEP8, format with `black` & `isort`  
+4. Add tests under `tests/`  
+5. Open a Pull Request
 
-Configuration
+---
 
-API Token: Obtain from the Expert Option platform and pass to the client constructor.
-Demo Mode: Set demo=True for demo accounts or demo=False for real accounts.
-Server URL: Defaults to wss://fr24g1eu.expertoption.com/ (Europe). Other regions available in constants.py.
+## 📄 License
 
-Contributing
-Contributions are welcome! Please follow these steps:
+MIT License. See [LICENSE](LICENSE) for details.
 
-Fork the repository.
-Create a new branch (git checkout -b feature/your-feature).
-Commit your changes (git commit -m "Add your feature").
-Push to the branch (git push origin feature/your-feature).
-Open a Pull Request.
+---
 
-Report issues or suggest features on the GitHub Issues page.
-Contact
-For support or inquiries, reach out to the developer:
+## 📬 Contact
 
-Telegram: @A11ksa
-Email: ar123ksa@gmail.com
-GitHub: A11ksa
+- **Author:** Ahmed Althuwaini (ar123ksa@gmail.com)  
+- **Telegram:** [@A11ksa](https://t.me/A11ksa)  
 
-License
-This project is licensed under the MIT License. See the LICENSE file for details.
+---
+
+*Crafted for precision, clarity, and professional-grade examples.*  
