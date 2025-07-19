@@ -67,6 +67,33 @@ pip install pytest pytest-asyncio black isort
 
 ## ⚡ Quick Start
 
+## Setting Context (Demo / Live)
+
+Before sending any other messages, set the context to demo or live using the following JSON payload:
+
+```json
+{"action":"setContext","message":{"is_demo":1},"token":"d0db01083337898cc46dc2a0af28f888","ns":1}
+```
+
+Example implementation in `connect()`:
+
+```python
+import json
+from websockets import connect
+
+class ExpertOptionAsync:
+    async def connect(self):
+        self.ws = await connect(self.url)
+        await self.ws.send(json.dumps({
+            "action": "setContext",
+            "message": {"is_demo": 1 if self.demo else 0},
+            "token": self.token,
+            "ns": 1
+        }))
+        # Now you can send other requests, e.g.:
+        await self.ws.send(json.dumps(["getBalance"]))
+```
+
 ### Asynchronous Client
 
 ```python
