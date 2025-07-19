@@ -17,17 +17,9 @@
 - [Overview](#overview)  
 - [Installation](#installation)  
 - [Quick Start](#quick-start)  
+- [Setting Context (Demo / Live)](#setting-context-demo--live)  
 - [Modules](#modules)  
-  - [Async Client](#async-client)  
-  - [Sync Client](#sync-client)  
-  - [Constants & Helpers](#constants--helpers)  
-  - [Validator](#validator)  
-  - [Tracing & Logging](#tracing--logging)  
 - [Examples](#examples)  
-  - [Basic Async Workflow](#basic-async-workflow)  
-  - [Historical Candles DataFrame](#historical-candles-dataframe)  
-  - [Synchronous Trading Script](#synchronous-trading-script)  
-  - [Custom Signal Bot](#custom-signal-bot)  
 - [Configuration](#configuration)  
 - [Troubleshooting](#troubleshooting)  
 - [Contributing](#contributing)  
@@ -36,63 +28,49 @@
 
 ---
 
-## 📖 Overview
+## Overview
 
-**ExpertOptionsToolsV2** is a Python library that enables seamless interaction with the Expert Option trading platform via its WebSocket API. It supports both **asynchronous** and **synchronous** workflows, offers robust connection management, and integrates powerful utilities for market data, trade execution, and logging.
+ExpertOptionsToolsV2 is a Python library for interacting with the Expert Option trading platform via its WebSocket API. It supports both asynchronous (`asyncio`) and synchronous workflows, offering robust connection management, real-time market data access, trade execution, and comprehensive logging.
 
 ---
 
-## 🛠️ Installation
+## Installation
 
 ```bash
-# Clone and install the library
 git clone https://github.com/A11ksa/Expert-Option-API.git
 cd Expert-Option-API
 python3 -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install .
 ```
 
-**Core dependencies**:
-- `websockets>=11.0.3`  
-- `pandas>=1.5.0`  
-- `rich>=13.0.0`  
+### Requirements
 
-**Dev dependencies** (for testing & formatting):
+- `websockets>=11.0.3`
+- `pandas>=1.5.0`
+- `rich>=13.0.0`
+
+### Development Requirements
+
 ```bash
 pip install pytest pytest-asyncio black isort
 ```
 
 ---
 
-## ⚡ Quick Start
+## Quick Start
 
-### Asynchronous Client
 ```python
 import asyncio
 from ExpertOptionsToolsV2.expertoption.asyncronous import ExpertOptionAsync
 from ExpertOptionsToolsV2.constants import DEFAULT_SERVER
 
 async def main():
-    token = "YOUR_AUTH_TOKEN"  # e.g., from DevTools "auth" cookie
+    token = "YOUR_AUTH_TOKEN"
     client = ExpertOptionAsync(token=token, demo=True, url=DEFAULT_SERVER)
     await client.connect()
-
     balance = await client.balance()
     print("Balance:", balance)
-
-    assets = await client.fetch_assets()
-    print("Assets:", len(assets), "symbols available")
-
-    # Place a CALL trade for 60 seconds
-    trade_id, result = await client.buy(
-        asset_id=142,         # e.g., ID for EURUSD
-        amount=5.0,
-        expiration_time=60,
-        check_win=True
-    )
-    print("Trade complete:", result)
-
     await client.disconnect()
 
 if __name__ == "__main__":
@@ -101,56 +79,49 @@ if __name__ == "__main__":
 
 ---
 
-## 📦 Modules
+## Setting Context (Demo / Live)
 
-### Async Client
-- **Location**: `ExpertOptionsToolsV2/expertoption/asyncronous.py`  
-- **Class**: `ExpertOptionAsync`  
-- **Key methods**:  
-  - `connect()` / `disconnect()`  
-  - `balance()`, `fetch_assets()`, `get_candles()`  
-  - `subscribe_symbol()` for streaming updates  
-  - `buy()`, `sell()`, `check_win()`
+Before sending any other messages, set the context to demo or live using the following JSON payload:
 
-### Sync Client
-- **Location**: `ExpertOptionsToolsV2/expertoption/syncronous.py`  
-- **Class**: `ExpertOption`  
-- **Usage**: identical methods in a blocking style for easy scripting.
-
-### Constants & Helpers
-- **`constants.data_assets`**: dict mapping asset names to IDs and metadata.  
-- **`constants.DEFAULT_SERVER`**: default WebSocket URL.  
-- **Utility**: `symbol_to_id("EURUSD")` → asset ID.
-
-### Validator
-```python
-from ExpertOptionsToolsV2.validator import Validator
-
-# Validate incoming message format
-validator = Validator(prefix="42["getBalance", suffix=""]")
-raw_msg = '42["getBalance", {"balance": 100}]'
-if validator.validate(raw_msg):
-    print("Valid balance payload")
+```json
+{"action":"setContext","message":{"is_demo":1},"token":"d0bf01282227898aa46dc2a0ad62f6b8","ns":1}
 ```
 
-### Tracing & Logging
-```python
-from ExpertOptionsToolsV2.tracing import LogBuilder
+Example implementation in `connect()`:
 
-logger = (
-    LogBuilder()
-    .log_file("logs/trades.log", level="INFO")
-    .terminal(level="DEBUG")
-    .build()
-)
-logger.info("Client connected!")
+```python
+import json
+from websockets import connect
+
+class ExpertOptionAsync:
+    async def connect(self):
+        self.ws = await connect(self.url)
+        await self.ws.send(json.dumps({
+            "action": "setContext",
+            "message": {"is_demo": 1 if self.demo else 0},
+            "token": self.token,
+            "ns": 1
+        }))
+        # Now you can send other requests, e.g.:
+        await self.ws.send(json.dumps(["getBalance"]))
 ```
 
 ---
 
-## 🧑‍💻 Examples
+## Modules
+
+- **Async Client** (`expertoption/asyncronous.py`): `ExpertOptionAsync`  
+- **Sync Client** (`expertoption/syncronous.py`): `ExpertOption`  
+- **Constants & Helpers** (`constants.py`): Asset mappings and utility functions  
+- **Validator** (`validator.py`): `Validator` for message format validation  
+- **Tracing & Logging** (`tracing.py`): `Logger` and `LogBuilder`  
+
+---
+
+## Examples
 
 ### Basic Async Workflow
+
 ```python
 import asyncio
 from ExpertOptionsToolsV2.expertoption.asyncronous import ExpertOptionAsync
@@ -159,35 +130,31 @@ async def demo():
     client = ExpertOptionAsync(token="...", demo=True)
     await client.connect()
     print(await client.balance())
-    print(await client.fetch_assets())
-    candles = await client.get_candles(asset_id=142, period=60, offset=0, duration=300)
-    print("Last 5 candles:", candles.tail())
     await client.disconnect()
 
 asyncio.run(demo())
 ```
 
 ### Historical Candles DataFrame
+
 ```python
-df = await client.get_candles(asset_id=142, period=60, offset=0, duration=3600)
-# DataFrame with columns: time, open, high, low, close, volume
-print(df.describe())
+df = await client.get_candles(asset_id=142, period=60, offset=0, duration=300)
+print(df.head())
 ```
 
 ### Synchronous Trading Script
+
 ```python
 from ExpertOptionsToolsV2.expertoption.syncronous import ExpertOption
 
 client = ExpertOption(token="YOUR_TOKEN", demo=False)
 client.connect()
-bal = client.balance()
-print("Live balance:", bal)
-order_id, res = client.buy(asset_id=145, amount=2.5, expiration_time=120)
-print("Order result:", res)
+print("Live balance:", client.balance())
 client.disconnect()
 ```
 
 ### Custom Signal Bot
+
 ```python
 import asyncio
 from ExpertOptionsToolsV2.expertoption.asyncronous import ExpertOptionAsync
@@ -203,59 +170,42 @@ async def signal_bot(signal_queue):
             expiration_time=signal.duration,
             check_win=True
         )
-        print(f"Executed {sid} → {result}")
-    # (Cleanup omitted)
+        print(f"Executed {sid} -> {result}")
 
-# Usage with any asyncio queue of signals
+# Use with any asyncio.Queue for signals
 ```
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
-- **Token**: retrieve from browser cookie `"auth"`.  
-- **Demo vs Live**: `demo=True/False` flag.  
-- **Server URL**: override via `url=` parameter.  
-
----
-
-## 🛠️ Troubleshooting
-
-- **Invalid auth**: ensure `token` matches your real session cookie.  
-- **Timeouts**: increase `ping_interval` or `timeout` when creating client.  
-- **Unexpected disconnects**: catch exceptions, implement retry loops:
-  ```python
-  for _ in range(5):
-      try:
-          await client.connect()
-          break
-      except Exception as e:
-          await asyncio.sleep(2)
-  ```
+- **Token**: Extract from browser DevTools cookie `auth`.  
+- **Demo vs Live**: Pass `demo=True` or `False`.  
+- **Server URL**: Override via the `url=` parameter.  
 
 ---
 
-## 🤝 Contributing
+## Troubleshooting
 
-1. Fork the repo  
-2. Create branch `feature/...`  
-3. Follow PEP8, format with `black` & `isort`  
-4. Add tests under `tests/`  
-5. Open a Pull Request
+- **Invalid token**: Verify the `token` value.  
+- **Timeouts**: Adjust `ping_interval` or `timeout`.  
+- **Disconnects**: Implement retry logic around `connect()`.
 
 ---
 
-## 📄 License
+## Contributing
+
+Please fork the repository, create a feature branch, follow PEP8, run `black` & `isort`, add tests under `tests/`, and submit a pull request.
+
+---
+
+## License
 
 MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
-## 📬 Contact
+## Contact
 
-- **Author:** Ahmed Althuwaini (ar123ksa@gmail.com)  
-- **Telegram:** [@A11ksa](https://t.me/A11ksa)  
-
----
-
-*Crafted for precision, clarity, and professional-grade examples.*  
+- **Author**: Ahmed <ar123ksa@gmail.com>  
+- **Telegram**: https://t.me/A11ksa
