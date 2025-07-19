@@ -102,7 +102,7 @@ from ExpertOptionsToolsV2.expertoption.asyncronous import ExpertOptionAsync
 from ExpertOptionsToolsV2.constants import DEFAULT_SERVER
 
 async def main():
-    token  = "YOUR_AUTH_TOKEN"               # from browser cookie `auth`
+    token  = "ADD_YOUR_TOKEN"  # d0db01083337898cc46dc2a0af28f888 from browser cookie `action`
     client = ExpertOptionAsync(token, demo=True, url=DEFAULT_SERVER)
     await client.connect()
     balance = await client.balance()
@@ -148,7 +148,9 @@ ExpertOptionsToolsV2/
 ├── constants.py         # Asset ID⇄symbol maps & helper functions
 ├── validator.py         # RawValidator & high‑level Validator wrappers
 ├── tracing.py           # Logger & LogBuilder for flexible logging
+├── __int__.py           # _all_ Main
 ├── expertoption/
+│   ├── __int__.py       # _all_
 │   ├── asyncronous.py   # ExpertOptionAsync & WebSocketClient
 │   └── syncronous.py    # ExpertOption (sync wrapper)
 └── setup.py             # Package metadata & dependencies
