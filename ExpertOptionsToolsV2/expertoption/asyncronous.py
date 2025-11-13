@@ -298,11 +298,12 @@ class WebSocketClient:
 
 class ExpertOptionAsync:
     def __init__(self, token: str, demo: bool = True, url: str = DEFAULT_SERVER):
-        self.token = token
-        self.demo = demo
-        self.url = url
         self.logger = Logger()
         self.client = WebSocketClient(token, self.logger, self.url)
+        self.url = url
+        self.token = token
+        self.demo = demo
+        self.uid = uid
         self.profile = None
         self.assets_data = []
         self.active_subscriptions = set()
